@@ -1,0 +1,51 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: quant-pricer
+  title: New Quant Version (three-repo split)
+  description: >-
+    Generate a standalone, frozen quant version by merging a pinned xp-platform tag (build
+    machinery) with pinned xp-pricer-templates pricer folders. Mirrors generate.sh.
+  tags: [cpp, quantlib, pricing, golden-path]
+spec:
+  owner: platform/devops
+  type: service
+  parameters:
+    - title: Version
+      required: [name, methods]
+      properties:
+        name:
+          type: string
+          title: Version name
+          pattern: '^quant-pricer[0-9]+$'
+        methods:
+          type: array
+          title: Pricer methods (each becomes pricers/<method>/)
+          items:
+            type: string
+            enum: [black_scholes, bachelier, american_binomial, barrier_mc]
+          default: [black_scholes, bachelier]
+        platform_ref:
+          type: string
+          title: xp-platform tag (build machinery)
+          default: platform-v1.0.0
+        pricers_ref:
+          type: string
+          title: xp-pricer-templates tag (pricer code)
+          default: pricers-v1.0.0
+  steps:
+    - id: generate
+      name: Merge pinned platform + pricers into a new repo
+      action: fetch:template      # production: two fetch steps, one per pinned tag
+      input:
+        url: ./template
+        values:
+          name: ${{ parameters.name }}
+          methods: ${{ parameters.methods }}
+          platform_ref: ${{ parameters.platform_ref }}
+          pricers_ref: ${{ parameters.pricers_ref }}
+    - id: register
+      name: Register in catalog
+      action: catalog:register
+      input:
+        catalogInfoPath: /catalog-info.yaml

@@ -1,0 +1,9 @@
+apiVersion: backstage.io/v1alpha1
+kind: Location
+metadata:
+  name: xp-split-templates
+  description: Registers the quant-pricer scaffolder template with the Backstage portal.
+spec:
+  type: file
+  targets:
+    - ./quant-pricer-template.yaml

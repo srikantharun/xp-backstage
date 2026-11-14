@@ -1,0 +1,35 @@
+# copier.yml — declarative form of generate.sh (the golden-path pattern from xp-pricer).
+# Copier pins platform/pricers to release tags with --vcs-ref and copies REAL content
+# (_preserve_symlinks: false), so a generated repo never carries a symlink. `copier update`
+# later 3-way-merges a newer platform tag into the generated repo.
+#
+#   copier copy --vcs-ref scaffold-v1.0.0 <xp-backstage> ./quant-pricerN
+#   copier update                                           # later, to take platform-v1.1.0
+_min_copier_version: "9.4"
+_subdirectory: template
+_answers_file: .copier-answers.yml
+_templates_suffix: .jinja
+_preserve_symlinks: false
+
+project_name:
+  type: str
+  help: Version name (kebab-case), e.g. quant-pricer4
+  validator: >-
+    {% if not (project_name | regex_search('^quant-pricer[0-9]+$')) %}expected quant-pricerN{% endif %}
+
+platform_ref:
+  type: str
+  help: xp-platform tag to pin (build machinery)
+  default: platform-v1.0.0
+
+pricers_ref:
+  type: str
+  help: xp-pricer-templates tag to pin (pricer code)
+  default: pricers-v1.0.0
+
+methods:
+  type: str
+  help: Comma-separated pricer methods to include
+  default: black_scholes,bachelier
+  choices: [black_scholes, bachelier, american_binomial, barrier_mc]
+  multiselect: true
