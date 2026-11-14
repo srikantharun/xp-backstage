@@ -20,7 +20,7 @@ project_name:
 platform_ref:
   type: str
   help: xp-platform tag to pin (build machinery)
-  default: platform-v1.0.0
+  default: platform-v1.2.0
 
 pricers_ref:
   type: str

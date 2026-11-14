@@ -28,7 +28,7 @@ spec:
         platform_ref:
           type: string
           title: xp-platform tag (build machinery)
-          default: platform-v1.0.0
+          default: platform-v1.2.0
         pricers_ref:
           type: string
           title: xp-pricer-templates tag (pricer code)
