@@ -34,6 +34,9 @@ PRICERS_REPO = XPSPLIT / "xp-pricer-templates"
 GENERATED = XPSPLIT / "generated"
 RUN_GUARDS = PLATFORM_REPO / "guards" / "run_guards.sh"
 TOOLCHAIN_IMAGE = "xp-toolchain:dev"
+REVIEWER_IMAGE = "xp-ci-reviewer:dev"
+RUN_REVIEW = XPSPLIT / "demo" / "run_review.sh"
+REVIEW_OUT = XPSPLIT / ".cache" / "review"
 VCPKG_CACHE = XPSPLIT / ".cache" / "vcpkg-archives"
 
 WORK_LOCK = threading.Lock()                   # one create/build at a time
@@ -138,6 +141,68 @@ def toolchain_available():
     return bool(r.stdout.strip())
 
 
+def generated_repos():
+    if not GENERATED.exists():
+        return []
+    return sorted(p.name for p in GENERATED.iterdir() if (p / ".git").is_dir())
+
+
+def repo_branches(name):
+    r = subprocess.run(["git", "-C", str(GENERATED / name), "branch", "--format=%(refname:short)"],
+                       capture_output=True, text=True, timeout=10)
+    return [b for b in r.stdout.split() if b]
+
+
+def _version_tuple(tag):
+    nums = re.findall(r"\d+", tag or "")
+    return tuple(int(x) for x in nums[:3]) if nums else (0,)
+
+
+def uses_run_step(name):
+    """platform-v1.2.0+ generated repos run the CI run_step steps; older ones cmake --workflow."""
+    return _version_tuple((answers_of(GENERATED / name) or {}).get("platform_ref", "")) >= (1, 2, 0)
+
+
+def md_to_html(md):
+    """Minimal Markdown -> HTML for the review reports (headers, tables, bold, code, bullets)."""
+    out, in_table = [], False
+    for raw in md.splitlines():
+        line = raw.rstrip()
+        if line.startswith("|") and set(line.replace("|", "").strip()) <= {"-", ":", " "} and in_table:
+            continue  # table separator row
+        if line.startswith("|"):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            tag = "td"
+            if not in_table:
+                out.append("<table>"); in_table = True; tag = "th"
+            out.append("<tr>" + "".join(f"<{tag}>{_inline(c)}</{tag}>" for c in cells) + "</tr>")
+            continue
+        if in_table:
+            out.append("</table>"); in_table = False
+        if not line:
+            continue
+        if line.startswith("### "):
+            out.append(f"<h3>{_inline(line[4:])}</h3>")
+        elif line.startswith("## "):
+            out.append(f"<h2>{_inline(line[3:])}</h2>")
+        elif line.startswith("# "):
+            out.append(f"<h1>{_inline(line[2:])}</h1>")
+        elif line.startswith("- "):
+            out.append(f"<div>• {_inline(line[2:])}</div>")
+        else:
+            out.append(f"<p>{_inline(line)}</p>")
+    if in_table:
+        out.append("</table>")
+    return "\n".join(out)
+
+
+def _inline(s):
+    s = html.escape(s)
+    s = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", s)
+    s = re.sub(r"`(.+?)`", r"<code>\1</code>", s)
+    return s
+
+
 # ---------------------------------------------------------------- HTML
 CSS = """
 body{font:15px/1.5 system-ui,sans-serif;max-width:860px;margin:2rem auto;padding:0 1rem;color:#1a1a2e}
@@ -151,12 +216,18 @@ button{background:#1f6feb;color:#fff;border:0;padding:.5rem 1rem;border-radius:6
 .card{border:1px solid #d0d7de;border-radius:8px;padding:.8rem 1rem;margin:.6rem 0}
 .err{background:#ffebe9;border:1px solid #ff8182;padding:.6rem 1rem;border-radius:6px}
 .muted{color:#656d76}
+table{border-collapse:collapse;margin:.6rem 0;font-size:14px}
+th,td{border:1px solid #d0d7de;padding:.3rem .6rem;text-align:left}
+th{background:#f6f8fa}
+.badge{display:inline-block;padding:.15rem .6rem;border-radius:999px;font-weight:600;font-size:13px}
+.pass{background:#dafbe1;color:#1a7f37}.block{background:#ffebe9;color:#b62324}
+.report{border:1px solid #d0d7de;border-radius:8px;padding:.2rem 1rem;margin:.6rem 0}
 """
 
 def page(title, body):
     return (f"<!doctype html><meta charset=utf-8><title>{html.escape(title)}</title>"
             f"<style>{CSS}</style>"
-            f"<nav><a href='/'>Create</a><a href='/catalog'>Catalog</a>"
+            f"<nav><a href='/'>Create</a><a href='/catalog'>Catalog</a><a href='/review'>Review</a>"
             f"<span class=muted>xp-split self-service portal</span></nav>"
             f"{body}")
 
@@ -254,6 +325,50 @@ def catalog_page():
     return page("Catalog", "".join(rows))
 
 
+def review_page(error=None):
+    repos = generated_repos()
+    branchmap = {r: repo_branches(r) for r in repos}
+    rows = ["<h1>Review an MR branch</h1>",
+            "<p class=muted>Runs <code>review.py</code> (guards + semgrep, exit 87) and "
+            "<code>testreview.py</code> (tests, exit 88) from a clone of xp-platform at the repo's "
+            "pinned tag, diffing the branch against <code>master</code> — exactly as the CI "
+            "component does.</p>"]
+    if error:
+        rows.append(f"<div class=err>{html.escape(error)}</div>")
+    if not repos:
+        return page("Review", "".join(rows) + "<p class=muted>No generated repos yet.</p>")
+    rows.append("<form method=post action=/review id=rf>")
+    rows.append("<label>Repository</label><select name=repo id=repo>")
+    for r in repos:
+        rows.append(f"<option>{html.escape(r)}</option>")
+    rows.append("</select>")
+    rows.append("<label>Branch</label><select name=branch id=branch></select>")
+    rows.append("<p><button type=submit>Run review + testreview</button></p></form>")
+    import json as _json
+    rows.append(f"<script>const BR={_json.dumps(branchmap)};"
+                "const rs=document.getElementById('repo'),bs=document.getElementById('branch');"
+                "function fill(){bs.innerHTML='';(BR[rs.value]||[]).forEach(b=>{"
+                "const o=document.createElement('option');o.textContent=b;bs.appendChild(o);});}"
+                "rs.addEventListener('change',fill);fill();</script>")
+    return page("Review", "".join(rows))
+
+
+def _badge(exit_code, kind):
+    if exit_code == 0:
+        return f"<span class='badge pass'>{kind}: PASS</span>"
+    return f"<span class='badge block'>{kind}: BLOCKED (exit {exit_code})</span>"
+
+
+def review_result_page(repo, branch, rexit, texit, rmd, tmd):
+    return page("Review result", f"""
+<h1>Review of <code>{html.escape(repo)}</code> · branch <code>{html.escape(branch)}</code></h1>
+<p>{_badge(rexit, 'review')} &nbsp; {_badge(texit, 'testreview')}</p>
+<div class=report>{md_to_html(rmd)}</div>
+<div class=report>{md_to_html(tmd)}</div>
+<p><a href='/review'>← back to Review</a></p>
+""")
+
+
 # ---------------------------------------------------------------- HTTP handler
 class Handler(BaseHTTPRequestHandler):
     server_version = "xp-portal/1.0"
@@ -297,6 +412,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, create_page())
         elif path == "/catalog":
             self._send(200, catalog_page())
+        elif path == "/review":
+            self._send(200, review_page())
         else:
             self._send(404, page("Not found", "<p>Not found.</p>"))
 
@@ -310,6 +427,8 @@ class Handler(BaseHTTPRequestHandler):
             self._create()
         elif path == "/build":
             self._build()
+        elif path == "/review":
+            self._review()
         else:
             self._send(404, page("Not found", "<p>Not found.</p>"))
 
@@ -356,23 +475,76 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.end_headers()
         try:
-            cmd = ["docker", "run", "--rm",
-                   "-v", f"{dest}:/src",
-                   "-v", f"{VCPKG_CACHE}:/cache/vcpkg-archives",
-                   "-e", "SCCACHE_DIR=/tmp/sccache",
-                   "-e", "VCPKG_DEFAULT_BINARY_CACHE=/cache/vcpkg-archives",
-                   "-w", "/src", TOOLCHAIN_IMAGE,
-                   "bash", "-lc", "cmake --workflow --preset ci-linux-gcc"]
+            if uses_run_step(name):
+                # platform-v1.2.0+: the exact four CI job steps, from the repo root.
+                inner = ("set -e; for s in build test-quarantined test budget; do "
+                         "echo \"##### run_step $s #####\"; "
+                         "python3 platform/tools/ci/run_step.py $s --preset ci-linux-gcc; done")
+                cmd = ["docker", "run", "--rm",
+                       "-v", f"{dest}:/src",
+                       "-v", f"{VCPKG_CACHE}:/cache/vcpkg-archives",
+                       "-e", "SCCACHE_DIR=/tmp/sccache",
+                       "-e", "VCPKG_BINARY_SOURCES=clear;files,/cache/vcpkg-archives,readwrite",
+                       "-w", "/src", TOOLCHAIN_IMAGE, "bash", "-lc", inner]
+            else:
+                cmd = ["docker", "run", "--rm",
+                       "-v", f"{dest}:/src",
+                       "-v", f"{VCPKG_CACHE}:/cache/vcpkg-archives",
+                       "-e", "SCCACHE_DIR=/tmp/sccache",
+                       "-e", "VCPKG_DEFAULT_BINARY_CACHE=/cache/vcpkg-archives",
+                       "-w", "/src", TOOLCHAIN_IMAGE, "bash", "-lc",
+                       "cmake --workflow --preset ci-linux-gcc"]
             self.wfile.write((" ".join(cmd) + "\n\n").encode())
             proc = subprocess.Popen(cmd, cwd=str(XPSPLIT), stdout=subprocess.PIPE,
                                     stderr=subprocess.STDOUT, text=True)
+            restored = tests = quarantined = budget = ""
             for line in proc.stdout:
                 try:
                     self.wfile.write(line.encode()); self.wfile.flush()
                 except BrokenPipeError:
                     proc.kill(); break
+                if "Restored" in line and "package" in line:
+                    restored = line.strip()
+                elif "tests passed" in line:
+                    tests = line.strip()
+                elif "quarantined tests:" in line:
+                    quarantined = line.strip()
+                elif "within budget" in line or "build budget" in line:
+                    budget = line.strip()
             proc.wait()
-            self.wfile.write(f"\n=== docker exit {proc.returncode} ===\n".encode())
+            summary = (f"\n===== summary =====\n"
+                       f"{restored or 'cache: (n/a)'}\n"
+                       f"tests: {tests or '(n/a)'}\n"
+                       f"quarantined: {quarantined or '(none)'}\n"
+                       f"budget: {budget or '(n/a)'}\n"
+                       f"docker exit {proc.returncode}\n")
+            self.wfile.write(summary.encode())
+        finally:
+            WORK_LOCK.release()
+
+    def _review(self):
+        form = self._form()
+        repo = (form.get("repo", [""])[0]).strip()
+        branch = (form.get("branch", [""])[0]).strip()
+        if repo not in generated_repos():
+            self._send(400, review_page(error=f"unknown repo {repo!r}"))
+            return
+        if branch not in repo_branches(repo):
+            self._send(400, review_page(error=f"unknown branch {branch!r}"))
+            return
+        if not WORK_LOCK.acquire(blocking=False):
+            self._send(409, review_page(error="busy: another create/build/review is running"))
+            return
+        try:
+            subprocess.run(["bash", str(RUN_REVIEW), repo, branch],
+                           cwd=str(XPSPLIT), capture_output=True, text=True, timeout=180)
+            out = REVIEW_OUT / f"{repo}__{branch}"
+            exits = (out / "exits.txt").read_text() if (out / "exits.txt").exists() else ""
+            rexit = int(re.search(r"REVIEW_EXIT=(\d+)", exits).group(1)) if "REVIEW_EXIT" in exits else -1
+            texit = int(re.search(r"TESTREVIEW_EXIT=(\d+)", exits).group(1)) if "TESTREVIEW_EXIT" in exits else -1
+            rmd = (out / "review-report.md").read_text() if (out / "review-report.md").exists() else "# review: (no report)"
+            tmd = (out / "testreview-report.md").read_text() if (out / "testreview-report.md").exists() else "# testreview: (no report)"
+            self._send(200, review_result_page(repo, branch, rexit, texit, rmd, tmd))
         finally:
             WORK_LOCK.release()
 
