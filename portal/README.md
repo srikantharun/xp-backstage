@@ -13,7 +13,7 @@ python3 portal/app.py        # listens on 127.0.0.1:7007 ONLY
 It is **not** exposed to the internet. Reach it over an SSH tunnel from your Mac:
 
 ```sh
-ssh -i ~/.ssh/<your_ssh_key> -L 7007:localhost:7007 root@<YOUR_SERVER_IP>
+ssh -i ~/.ssh/<ssh_key> -L 7007:localhost:7007 root@<ip>
 # then open http://localhost:7007
 ```
 
