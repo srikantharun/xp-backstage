@@ -11,9 +11,11 @@ subprocess uses argument lists (never shell=True) with timeouts; one create/buil
 Start:  python3 portal/app.py
 """
 import html
+import json
 import re
 import subprocess
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -37,6 +39,8 @@ TOOLCHAIN_IMAGE = "xp-toolchain:dev"
 REVIEWER_IMAGE = "xp-ci-reviewer:dev"
 RUN_REVIEW = XPSPLIT / "demo" / "run_review.sh"
 REVIEW_OUT = XPSPLIT / ".cache" / "review"
+PROFILE_BUILD = XPSPLIT / "demo" / "profile_build.sh"
+PROFILES_DIR = XPSPLIT / ".cache" / "profiles"
 VCPKG_CACHE = XPSPLIT / ".cache" / "vcpkg-archives"
 
 WORK_LOCK = threading.Lock()                   # one create/build at a time
@@ -228,6 +232,7 @@ def page(title, body):
     return (f"<!doctype html><meta charset=utf-8><title>{html.escape(title)}</title>"
             f"<style>{CSS}</style>"
             f"<nav><a href='/'>Create</a><a href='/catalog'>Catalog</a><a href='/review'>Review</a>"
+            f"<a href='/profile'>Profile</a>"
             f"<span class=muted>xp-split self-service portal</span></nav>"
             f"{body}")
 
@@ -369,6 +374,93 @@ def review_result_page(repo, branch, rexit, texit, rmd, tmd):
 """)
 
 
+# ---------------------------------------------------------------- Profile (build statistics)
+def list_profiles():
+    """All stored profiles, newest first."""
+    if not PROFILES_DIR.exists():
+        return []
+    out = []
+    for d in sorted(PROFILES_DIR.iterdir(), reverse=True):
+        f = d / "stats.json"
+        if f.is_file():
+            try:
+                out.append(json.loads(f.read_text()))
+            except Exception:
+                pass
+    return out
+
+
+def read_profile(pid):
+    f = PROFILES_DIR / pid / "stats.json"
+    return json.loads(f.read_text()) if f.is_file() else None
+
+
+def profile_page(error=None):
+    repos = generated_repos()
+    rows = ["<h1>Profile a build</h1>",
+            "<p class=muted>Runs a full build in <code>xp-toolchain:dev</code>, assigns a "
+            "<b>profile-id</b>, and stores build statistics + a Perfetto-openable trace you can "
+            "query later by id (like a BuildBuddy invocation).</p>"]
+    if error:
+        rows.append(f"<div class=err>{html.escape(error)}</div>")
+    if repos:
+        rows.append("<form method=post action=/profile><label>Repository</label><select name=repo>")
+        for r in repos:
+            rows.append(f"<option>{html.escape(r)}</option>")
+        rows.append("</select><p><button type=submit>Profile build</button> "
+                    "<span class=muted>(full compile — ~20s)</span></p></form>")
+    rows.append("<h2>Recent profiles</h2>")
+    profs = list_profiles()
+    if not profs:
+        rows.append("<p class=muted>None yet.</p>")
+    else:
+        rows.append("<table><tr><th>profile-id</th><th>repo</th><th>build</th><th>targets</th><th>tests</th></tr>")
+        for s in profs:
+            rows.append(f"<tr><td><a href='/profiles?id={html.escape(s['profile_id'])}'>{html.escape(s['profile_id'])}</a></td>"
+                        f"<td>{html.escape(str(s.get('repo','')))}</td>"
+                        f"<td>{s.get('build_wall_s','?')}s</td>"
+                        f"<td>{s.get('num_targets','?')}</td>"
+                        f"<td>{html.escape(str(s.get('tests','') or ''))}</td></tr>")
+        rows.append("</table>")
+    return page("Profile", "".join(rows))
+
+
+def profile_detail_page(stats):
+    pid = stats["profile_id"]
+    slow = "".join(
+        f"<tr><td>{s['ms']} ms</td><td><code>{html.escape(s['target'])}</code></td></tr>"
+        for s in stats.get("slowest_targets", []))
+    gf, portable = stats.get("glibc_floor"), stats.get("portable")
+    if gf and portable:
+        port_cell = f"<span class='badge pass'>runs on RHEL 8</span> &nbsp;max required {html.escape(gf)} ≤ glibc 2.28"
+    elif gf:
+        port_cell = f"<span class='badge block'>would FAIL on RHEL 8</span> &nbsp;needs {html.escape(gf)} &gt; 2.28 (wrong sysroot)"
+    else:
+        port_cell = "(n/a)"
+    sug = "".join(f"<li>{html.escape(s)}</li>" for s in stats.get("suggestions", [])) or "<li class=muted>none</li>"
+    return page("Profile result", f"""
+<h1>Profile <code>{html.escape(pid)}</code></h1>
+<p class=muted>repo {html.escape(str(stats.get('repo','')))} · preset {html.escape(str(stats.get('preset','')))}</p>
+<table>
+<tr><th>restored packages</th><td>{stats.get('restored_packages','?')} (from warm cache)</td></tr>
+<tr><th>configure</th><td>{stats.get('configure_s','?')} s</td></tr>
+<tr><th>vcpkg restore</th><td>{stats.get('vcpkg_restore_s','?')} s</td></tr>
+<tr><th>build wall</th><td>{stats.get('build_wall_s','?')} s</td></tr>
+<tr><th>targets built</th><td>{stats.get('num_targets','?')}</td></tr>
+<tr><th>tests</th><td>{html.escape(str(stats.get('tests','') or ''))}</td></tr>
+<tr><th>portability (glibc floor)</th><td>{port_cell}</td></tr>
+</table>
+<h2>Suggestions</h2>
+<ul>{sug}</ul>
+<h2>Slowest targets</h2>
+<table><tr><th>time</th><th>target</th></tr>{slow}</table>
+<h2>Trace</h2>
+<p><a href='/trace?id={html.escape(pid)}'>⬇ download build-trace.json</a> — open it at
+<code>https://ui.perfetto.dev</code> (or <code>chrome://tracing</code>) to see the build timeline.</p>
+<p><a href='/profile'>← back to Profile</a></p>
+""")
+
+
 # ---------------------------------------------------------------- HTTP handler
 class Handler(BaseHTTPRequestHandler):
     server_version = "xp-portal/1.0"
@@ -414,6 +506,27 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, catalog_page())
         elif path == "/review":
             self._send(200, review_page())
+        elif path == "/profile":
+            self._send(200, profile_page())
+        elif path == "/profiles":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            pid = (qs.get("id", [""])[0])
+            stats = read_profile(pid) if pid else None
+            self._send(200, profile_detail_page(stats) if stats else profile_page(error=f"unknown profile {pid!r}"))
+        elif path == "/trace":
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            pid = qs.get("id", [""])[0]
+            f = PROFILES_DIR / pid / "build-trace.json"
+            if re.fullmatch(r"prof-[0-9A-Za-z\-]+", pid or "") and f.is_file():
+                data = f.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Disposition", f'attachment; filename="{pid}-trace.json"')
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self._send(404, page("Not found", "<p>No such trace.</p>"))
         else:
             self._send(404, page("Not found", "<p>Not found.</p>"))
 
@@ -429,6 +542,8 @@ class Handler(BaseHTTPRequestHandler):
             self._build()
         elif path == "/review":
             self._review()
+        elif path == "/profile":
+            self._profile()
         else:
             self._send(404, page("Not found", "<p>Not found.</p>"))
 
@@ -545,6 +660,30 @@ class Handler(BaseHTTPRequestHandler):
             rmd = (out / "review-report.md").read_text() if (out / "review-report.md").exists() else "# review: (no report)"
             tmd = (out / "testreview-report.md").read_text() if (out / "testreview-report.md").exists() else "# testreview: (no report)"
             self._send(200, review_result_page(repo, branch, rexit, texit, rmd, tmd))
+        finally:
+            WORK_LOCK.release()
+
+    def _profile(self):
+        form = self._form()
+        repo = (form.get("repo", [""])[0]).strip()
+        if repo not in generated_repos():
+            self._send(400, profile_page(error=f"unknown repo {repo!r}"))
+            return
+        if not toolchain_available():
+            self._send(400, profile_page(error="toolchain image unavailable"))
+            return
+        if not WORK_LOCK.acquire(blocking=False):
+            self._send(409, profile_page(error="busy: another build/review/profile is running"))
+            return
+        try:
+            pid = "prof-" + time.strftime("%Y%m%d-%H%M%S")
+            subprocess.run(["bash", str(PROFILE_BUILD), repo, pid],
+                           cwd=str(XPSPLIT), capture_output=True, text=True, timeout=300)
+            stats = read_profile(pid)
+            if stats:
+                self._send(200, profile_detail_page(stats))
+            else:
+                self._send(500, profile_page(error=f"profile {pid} produced no stats (see .cache/profiles/{pid}/build.log)"))
         finally:
             WORK_LOCK.release()
 
